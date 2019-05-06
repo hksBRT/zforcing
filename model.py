@@ -13,9 +13,11 @@ import random
 from itertools import chain
 import load
 import torch.nn.functional as F
-from torch.nn._functions.thnn import rnnFusedPointwise as fusedBackend
+import rnnFusedPointwise as fusedBackend
+# from torch.nn._functions.thnn import rnnFusedPointwise as fusedBackend
 import math
 
+import pdb
 
 def log_prob_gaussian(x, mu, log_vars, mean=False):
     lp = - 0.5 * math.log(2 * math.pi) \
@@ -113,7 +115,7 @@ class LSTMCell(nn.Module):
         Returns:
             h_1, c_1: Tensors containing the next hidden and cell state.
         """
-        assert input_.is_cuda
+        # assert input_.is_cuda
         h_0, c_0 = hx
         igates = torch.mm(input_, self.weight_ih)
         hgates = torch.mm(h_0, self.weight_hh)
@@ -238,6 +240,7 @@ class ZForcing(nn.Module):
                 Variable(weight.new(self.nlayers, bsz, self.rnn_dim).zero_()))
 
     def fwd_pass(self, x_fwd, hidden, bwd_states=None, z_step=None):
+        # pdb.set_trace()
         x_fwd = self.emb_mod(x_fwd)
         nsteps = x_fwd.size(0)
         states = [(hidden[0][0], hidden[1][0])]
@@ -276,10 +279,10 @@ class ZForcing(nn.Module):
                 # disconnect gradient here
                 b_step_ = b_step.detach()
                 if self.use_l2:
-                    aux_step = torch.sum((b_step_ - F.tanh(aux_mu)) ** 2.0, 1)
+                    aux_step = torch.sum((b_step_ - torch.tanh(aux_mu)) ** 2.0, 1)
                 else:
                     aux_step = -log_prob_gaussian(
-                            b_step_, F.tanh(aux_mu), aux_logvar, mean=False)
+                            b_step_, torch.tanh(aux_mu), aux_logvar, mean=False)
             # generation phase
             else:
                 # sample from the prior
@@ -330,7 +333,7 @@ class ZForcing(nn.Module):
     def bwd_pass(self, x, y, hidden):
         idx = np.arange(y.size(0))[::-1].tolist()
         idx = torch.LongTensor(idx)
-        idx = Variable(idx).cuda()
+        idx = Variable(idx)
 
         # invert the targets and revert back
         x_bwd = y.index_select(0, idx)
@@ -343,6 +346,7 @@ class ZForcing(nn.Module):
         return states, outputs
 
     def forward(self, x, y, x_mask, hidden, return_stats=False):
+        pdb.set_trace()
         nsteps, nbatch = x.size(0), x.size(1)
         bwd_states, bwd_outputs = self.bwd_pass(x, y, hidden)
         fwd_outputs, fwd_states, klds, aux_nll, zs, log_pz, log_qz = self.fwd_pass(

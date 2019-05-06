@@ -44,6 +44,7 @@ def evaluate(dataset, model):
 @click.option('--kla_sta', default=0.2)
 @click.option('--cond_ln', is_flag=True)
 @click.option('--z_force', is_flag=True)
+
 def train(expname, nlayers, seed, num_epochs, rnn_dim, data, bsz, lr, z_dim,
           emb_dim, mlp_dim, aux_sta, aux_end, kla_sta, bwd, cond_ln, z_force):
     rng = np.random.RandomState(seed)
