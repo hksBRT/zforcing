@@ -240,44 +240,58 @@ class ZForcing(nn.Module):
                 Variable(weight.new(self.nlayers, bsz, self.rnn_dim).zero_()))
 
     def fwd_pass(self, x_fwd, hidden, bwd_states=None, z_step=None):
-        # pdb.set_trace()
+        
         x_fwd = self.emb_mod(x_fwd)
         nsteps = x_fwd.size(0)
         states = [(hidden[0][0], hidden[1][0])]
         klds, zs, log_pz, log_qz, aux_cs = [], [], [], [], []
         eps = Variable(next(self.parameters()).data.new(
-            nsteps, x_fwd.size(1), self.z_dim).normal_())
-        big = Variable(next(self.parameters()).data.new(x_fwd.size(1)).zero_()) + 0.5
+            nsteps, x_fwd.size(1), self.z_dim).normal_()) #for batch size 1
+        big = Variable(next(self.parameters()).data.new(x_fwd.size(1)).zero_()) + 0.5 #for batch size 1
         big = torch.bernoulli(big).unsqueeze(1)
 
         assert (z_step is None) or (nsteps == 1)
+
+        # for entire trajectory
         for step in range(nsteps):
             states_step = states[step]
             x_step = x_fwd[step]
             h_step, c_step = states_step[0], states_step[1]
             r_step = eps[step]
             
-            pri_params = self.pri_mod(h_step)
-            pri_params = torch.clamp(pri_params, -8., 8.)
-            pri_mu, pri_logvar = torch.chunk(pri_params, 2, 1)
+            # prior func of hidden state
+            pri_params = self.pri_mod(h_step) #linear, lrelu, linear (twice dim)
+            pri_params = torch.clamp(pri_params, -8., 8.) #where did 8 come from
+            pri_mu, pri_logvar = torch.chunk(pri_params, 2, 1) #split to 2
             
             # inference phase
             if bwd_states is not None:
                 b_step = bwd_states[step]
-                inf_params = self.inf_mod(torch.cat((h_step, b_step), 1))
+                # concat prior and backward rnn output
+                inf_params = self.inf_mod(torch.cat((h_step, b_step), 1)) #linear, lrelu, linear (twice dim)
                 inf_params = torch.clamp(inf_params, -8., 8.)
                 inf_mu, inf_logvar = torch.chunk(inf_params, 2, 1)
+
+                # kl div between prior and prior-bwd
                 kld = gaussian_kld(inf_mu, inf_logvar, pri_mu, pri_logvar)
+
+                # why reparametrize, always done for latent variables
                 z_step = self.reparametrize(inf_mu, inf_logvar, eps=r_step)
+
+                # use only latent variables
                 if self.z_force:
                     h_step_ = h_step * 0.
                 else:
                     h_step_ = h_step
-                aux_params = self.aux_mod(torch.cat((h_step_, z_step), 1))
+
+                # looks like aux loss, reconstruct bwd step pred using h and z
+                aux_params = self.aux_mod(torch.cat((h_step_, z_step), 1)) #lin,lrelu,lin
                 aux_params = torch.clamp(aux_params, -8., 8.)
                 aux_mu, aux_logvar = torch.chunk(aux_params, 2, 1)
-                # disconnect gradient here
+                # disconnect gradient here,paper talks about this
                 b_step_ = b_step.detach()
+
+                # l2 loss or log prob
                 if self.use_l2:
                     aux_step = torch.sum((b_step_ - torch.tanh(aux_mu)) ** 2.0, 1)
                 else:
@@ -288,25 +302,31 @@ class ZForcing(nn.Module):
                 # sample from the prior
                 if z_step is None:
                     z_step = self.reparametrize(pri_mu, pri_logvar, eps=r_step)
+
                 aux_step = torch.sum(pri_mu * 0., -1)
                 inf_mu, inf_logvar = pri_mu, pri_logvar
                 kld = aux_step
 
-            i_step = self.gen_mod(z_step)
+            i_step = self.gen_mod(z_step) #lin, lrelu, lin
             if self.cond_ln:
                 i_step = torch.clamp(i_step, -3, 3)
                 gain_hh, bias_hh = torch.chunk(i_step, 2, 1)
                 gain_hh = 1. + gain_hh
                 h_new, c_new = self.fwd_mod(x_step, (h_step, c_step),
-                                            gain_hh=gain_hh, bias_hh=bias_hh)
+                                            gain_hh=gain_hh, bias_hh=bias_hh) #1lstmcell
+
             else:
                 h_new, c_new = self.fwd_mod(torch.cat((i_step, x_step), 1),
-                                            (h_step, c_step))
+                                            (h_step, c_step)) #1lstmcell
             states.append((h_new, c_new))
             klds.append(kld)
             zs.append(z_step)
             aux_cs.append(aux_step)
+
+            # prior loss
             log_pz.append(log_prob_gaussian(z_step, pri_mu, pri_logvar))
+
+            #inf loss
             log_qz.append(log_prob_gaussian(z_step, inf_mu, inf_logvar))
 
         klds = torch.stack(klds, 0)
@@ -315,6 +335,8 @@ class ZForcing(nn.Module):
         log_qz = torch.stack(log_qz, 0)
         zs = torch.stack(zs, 0)
 
+        # get only hidden states for all steps
+        #first one is initialized, so all 0
         outputs = [s[0] for s in states[1:]]
         outputs = torch.stack(outputs, 0)
         outputs = self.fwd_out_mod(outputs)
@@ -330,19 +352,21 @@ class ZForcing(nn.Module):
                 x_, hidden, bwd_states=bwd_states)
         return zs
 
+    # big question - why is y sent as output
     def bwd_pass(self, x, y, hidden):
-        idx = np.arange(y.size(0))[::-1].tolist()
+        # pdb.set_trace()
+        idx = np.arange(y.size(0))[::-1].tolist() #list of seq length indices in reverse
         idx = torch.LongTensor(idx)
         idx = Variable(idx)
 
         # invert the targets and revert back
-        x_bwd = y.index_select(0, idx)
-        x_bwd = torch.cat([x_bwd, x[:1]], 0)
-        x_bwd = self.emb_mod(x_bwd)
-        states, _ = self.bwd_mod(x_bwd, hidden)
-        outputs = self.bwd_out_mod(states[:-1])
-        states = states.index_select(0, idx)
-        outputs = outputs.index_select(0, idx)
+        x_bwd = y.index_select(0, idx) #invert targets
+        x_bwd = torch.cat([x_bwd, x[:1]], 0) #append x[0]
+        x_bwd = self.emb_mod(x_bwd) #embedding
+        states, _ = self.bwd_mod(x_bwd, hidden) #1lstmcell
+        outputs = self.bwd_out_mod(states[:-1]) #linear
+        states = states.index_select(0, idx) #invert back
+        outputs = outputs.index_select(0, idx) #invert back
         return states, outputs
 
     def forward(self, x, y, x_mask, hidden, return_stats=False):
@@ -351,6 +375,8 @@ class ZForcing(nn.Module):
         bwd_states, bwd_outputs = self.bwd_pass(x, y, hidden)
         fwd_outputs, fwd_states, klds, aux_nll, zs, log_pz, log_qz = self.fwd_pass(
             x, hidden, bwd_states=bwd_states)
+
+        # mask across seq and sum
         kld = (klds * x_mask).sum(0)
         log_pz = (log_pz * x_mask).sum(0)
         log_qz = (log_qz * x_mask).sum(0)
@@ -358,8 +384,12 @@ class ZForcing(nn.Module):
         
         if self.out_type == 'gaussian':
             out_mu, out_logvar = torch.chunk(fwd_outputs, 2, -1)
+            
+            # for forward, true is y
             fwd_nll = -log_prob_gaussian(y, out_mu, out_logvar)
             fwd_nll = (fwd_nll * x_mask).sum(0)
+
+            # for bwd, true is x
             out_mu, out_logvar = torch.chunk(bwd_outputs, 2, -1)
             bwd_nll = -log_prob_gaussian(x, out_mu, out_logvar)
             bwd_nll = (bwd_nll * x_mask).sum(0)

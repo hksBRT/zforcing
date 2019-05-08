@@ -10,12 +10,13 @@ if __name__ == "__main__":
     rng = np.random.RandomState(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    inp_dim = 200
+    inp_dim = 5# 200
     model = ZForcing(inp_dim=inp_dim, emb_dim=512, rnn_dim=1024, z_dim=256,
                      mlp_dim=512, out_dim=400, nlayers=1,
                      cond_ln=True)
     model.z_force = True
-    bsz = 32
+    bsz = 2 #32
+    seq = 5 #40
     hidden = model.init_hidden(bsz)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3, eps=1e-5)
 
@@ -30,8 +31,8 @@ if __name__ == "__main__":
         (0., 0., 0., 0., 0.)
     model.train()
 
-    x = np.random.random((bsz,40,inp_dim))
-    y = np.random.random((bsz,40,inp_dim))
+    x = np.random.random((bsz,seq,inp_dim))
+    y = np.random.random((bsz,seq,inp_dim))
     x_mask = np.ones((bsz,40))
     
     
@@ -47,7 +48,7 @@ if __name__ == "__main__":
     #                             X_std=1)
 
     x = x.transpose(1, 0, 2)
-    y = y.transpose(1, 0, 2)
+    y = y.transpose(1, 0, 2)   
     x_mask = x_mask.T
 
     opt.zero_grad()
