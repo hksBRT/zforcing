@@ -5,7 +5,7 @@ from torch.nn import Parameter
 from torch.autograd import Variable
 import torchvision.datasets as dsets
 import time
-import click
+# import click
 import numpy
 import numpy as np
 import os
