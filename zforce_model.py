@@ -75,8 +75,8 @@ class ZForcing(tf.keras.Model):
         self.rnn_bwd_layer = tf.keras.layers.LSTM(
             units=rnn_dim, 
             recurrent_initializer="orthogonal",
-            return_state=True,
-            return_sequences=False
+            return_state=False,
+            return_sequences=True,
         )
 
         #  PRIOR LAYERS - gives mean and logvar
@@ -145,26 +145,25 @@ class ZForcing(tf.keras.Model):
 
         #as per paper, share params btn bwd and fwd rnn by passing hidden
         rev_targets_and_input = tf.transpose(rev_targets_and_input,perm=[1,0,2])
-        pdb.set_trace()
-        rev_lstm_output, _ = self.rnn_bwd_layer(rev_targets_and_input, initial_state=[hidden_states,cell_states]) 
+        #this is bt
+        rev_lstm_output = self.rnn_bwd_layer(rev_targets_and_input, initial_state=[hidden_states,cell_states]) 
         
 
-        rev_hidden_states = tf.transpose(rev_hidden_states,perm=[1,0,2])
+        rev_lstm_output = tf.transpose(rev_lstm_output,perm=[1,0,2])
+        rev_final_output = self.final_bwd_layer(rev_lstm_output[:-1])
 
-        rev_outputs = self.final_bwd_layer(rev_hidden_states[:-1])
-
-        hidden_states = tf.reverse_sequence(rev_hidden_states, seq_lengths, seq_axis=0, batch_axis=1)
-        outputs = tf.reverse_sequence(rev_outputs, seq_lengths, seq_axis=0, batch_axis=1)
-        return hidden_states, outputs
+        rev_lstm_output = tf.reverse_sequence(rev_lstm_output, seq_lengths, seq_axis=0, batch_axis=1)
+        rev_final_output = tf.reverse_sequence(rev_final_output, seq_lengths, seq_axis=0, batch_axis=1)
+        return rev_lstm_output, rev_final_output
 
     def call(self,inputs, targets, hidden, cell):
         hidden,output = self.inference_model(inputs, targets, hidden, cell)
         return output
 
 def create_test_input():
-    batch_size = 4
-    seq_len = 10
-    feature_size = 5
+    batch_size = 1
+    seq_len = 5
+    feature_size = 3
     x = tf.random_normal((batch_size,seq_len,feature_size))
     y = tf.random_normal((batch_size,seq_len,feature_size))
     x = tf.transpose(x, perm=[1,0,2])
@@ -173,10 +172,10 @@ def create_test_input():
     return x,y
                 
 def unit_test_model():
-    model = ZForcing(inp_dim=5, emb_dim=10, rnn_dim=15, z_dim=20,
+    x,y = create_test_input()
+    model = ZForcing(inp_dim=x.shape[2], emb_dim=10, rnn_dim=15, z_dim=20,
                      mlp_dim=25, out_dim=30, nlayers=1,
                      cond_ln=False)
-    x,y = create_test_input()
     hidden, cell_state = model.init_hidden_state(x.shape[1])
     pred = model(x,y,hidden, cell_state)
 
