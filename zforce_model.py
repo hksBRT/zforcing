@@ -25,10 +25,6 @@ def log_prob_gaussian(x, mu, log_vars, mean=False):
         return tf.reduce_mean(lp, -1)
     return tf.reduce_sum(lp, -1)
 
-def log_prob_bernoulli(x, mu):
-    lp = x * tf.log(mu + 1e-5) + (1. - y) * tf.log(1. - mu + 1e-5)
-    return lp
-
 def gaussian_kld(mu_left, logvar_left, mu_right, logvar_right):
     """
     Compute KL divergence between a bunch of univariate Gaussian distributions
@@ -225,6 +221,7 @@ class ZForcing(tf.keras.Model):
             z_gen_step = self.generation_layer(z_step)
             
             # the generation part with LSTM
+            # TO DO: ADD LAYER NORM LSTM CELL
             # if self.cond_ln:
             #     z_gen_step = tf.clip_by_value(z_gen_step, -3, 3)
             #     gain_hh, bias_hh = tf.split(z_gen_step, 2, axis=1)
@@ -306,11 +303,14 @@ class ZForcing(tf.keras.Model):
             out_mu, out_logvar = tf.split(bwd_final_output, 2, -1)
             bwd_nll = -log_prob_gaussian(inputs, out_mu, out_logvar)
             bwd_nll = tf.reduce_sum(bwd_nll,0)
+        
         if return_stats:        
             return fwd_nll, bwd_nll, aux_nll, kld, log_pz, log_qz
         
         return tf.reduce_mean(fwd_nll), tf.reduce_mean(bwd_nll), tf.reduce_mean(aux_nll), tf.reduce_mean(kld)
 
+#######################################
+###### UNIT TEST PORTION ##############
 def create_test_input():
     batch_size = 1
     seq_len = 5
@@ -327,18 +327,13 @@ def unit_test_model():
     model = ZForcing(inp_dim=x.shape[2], emb_dim=10, rnn_dim=20, z_dim=15,
                      mlp_dim=10, out_dim=x.shape[2]*2, nlayers=1,
                      cond_ln=False)
-    hidden, cell_state = model.init_hidden_state(x.shape[1])
-    fwd_nll, bwd_nll, aux_nll, kld = model(x,y,hidden, cell_state)
+    hidden_state, cell_state = model.init_hidden_state(x.shape[1])
+    fwd_nll, bwd_nll, aux_nll, kld = model(x,y,hidden_state, cell_state)
     print(fwd_nll, bwd_nll, aux_nll, kld)
-
-    
-
 
 if __name__ == "__main__":
     tf.enable_eager_execution()
     unit_test_model()
-
-
 
 
 
