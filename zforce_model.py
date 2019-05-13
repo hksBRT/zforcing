@@ -76,7 +76,7 @@ class ZForcing(tf.keras.Model):
         # self.hidden_state = None
         # self.cell_state = None
 
-        # EMBEDDING LAYERS
+        # EMBEDDING LAYERS - for now, keep same for both fwd and bwd
         self.embedding_layer = tf.keras.models.Sequential([
             tf.keras.layers.Dense(units=emb_dim, input_dim=inp_dim), 
             tf.keras.layers.Dropout(rate=dropout)
@@ -113,6 +113,18 @@ class ZForcing(tf.keras.Model):
             tf.keras.layers.Dense(units=z_dim * 2)
         ])
 
+        # DECODER LAYERS - maybe add batchnorm
+        self.decoder_bwd_layer = tf.keras.models.Sequential([
+            tf.keras.layers.Dense(units=mlp_dim, input_dim=rnn_dim), 
+            LReLU(), 
+            tf.keras.layers.Dense(units=out_dim)
+        ])
+        self.decoder_fwd_layer = tf.keras.models.Sequential([
+            tf.keras.layers.Dense(units=mlp_dim, input_dim=rnn_dim), 
+            LReLU(), 
+            tf.keras.layers.Dense(units=out_dim)
+        ])
+
         # FINAL LAYERS - gives next state
         self.final_fwd_layer = tf.keras.layers.Dense(units=out_dim, input_dim=rnn_dim)
         self.final_bwd_layer = tf.keras.layers.Dense(units=out_dim, input_dim=rnn_dim)
@@ -131,7 +143,7 @@ class ZForcing(tf.keras.Model):
         self.aux_reconstruction_layer = tf.keras.models.Sequential([
             tf.keras.layers.Dense(units=mlp_dim, input_dim=z_dim + rnn_dim),
             LReLU(),
-            tf.keras.layers.Dense(units=2 * rnn_dim),
+            tf.keras.layers.Dense(units=rnn_dim *2),
         ])
 
     def reparametrize(self, mu, logvar, eps=None):
@@ -195,6 +207,8 @@ class ZForcing(tf.keras.Model):
                     hidden_step = hidden_step * 0.
 
                 # looks like aux loss, reconstruct bwd step pred using h and z
+                # apparently z force is always set to 0, so it uses on h as the paper says. 
+                ##### check again
                 aux_params = self.aux_reconstruction_layer(tf.concat((hidden_step, z_step), axis=1))
                 aux_params = tf.clip_by_value(aux_params, -8., 8.)
                 aux_mu, aux_logvar = tf.split(aux_params, 2, axis=1)
@@ -239,10 +253,10 @@ class ZForcing(tf.keras.Model):
             zs.append(z_step)
             aux_cs.append(aux_step)
 
-            # prior loss
+            # prior loss - just for stats
             log_pz.append(log_prob_gaussian(z_step, z_pri_mu, z_pri_logvar))
 
-            #inf loss
+            #inf loss - just for stats
             log_qz.append(log_prob_gaussian(z_step, z_post_mu, z_post_logvar))
 
         klds = tf.stack(klds, 0)
@@ -262,29 +276,46 @@ class ZForcing(tf.keras.Model):
         return fwd_final_outputs, rnn_states[1:], klds, aux_cs, zs, log_pz, log_qz            
 
 
+    # backward pass
+    def bwd_pass(self,x, y, hidden_states, cell_states):
+        # x - inputs
+        # y - targets
+        # import ipdb; ipdb.set_trace()
+        seq_lengths = tf.constant(y.shape[0], shape=[y.shape[1]])
+        y_bwd = tf.reverse_sequence(y, seq_lengths, seq_axis=0, batch_axis=1)
+        y_bwd = tf.stop_gradient(y_bwd)
 
-    def inference_model(self,inputs, targets, hidden_states, cell_states):
-        seq_lengths = tf.constant(targets.shape[0], shape=[targets.shape[1]])
-        rev_targets = tf.reverse_sequence(targets, seq_lengths, seq_axis=0, batch_axis=1)
-        rev_targets_and_input = tf.concat([rev_targets, inputs[:1]], axis=0)
+        seq_lengths = tf.constant(x.shape[0], shape=[x.shape[1]])
+        x_bwd = tf.reverse_sequence(x, seq_lengths, seq_axis=0, batch_axis=1)  
 
-        rev_targets_and_input = self.embedding_layer(rev_targets_and_input)
+        x_bwd_reshape = tf.reshape(x_bwd, [-1, x_bwd.shape[2]])
+        x_emb = self.embedding_layer(x_bwd_reshape)
+        x_bwd = tf.reshape(x_emb, [*x_bwd.shape[:2], self.emb_dim])
 
         #as per paper, share params btn bwd and fwd rnn by passing hidden
-        rev_targets_and_input = tf.transpose(rev_targets_and_input,perm=[1,0,2])
+        x_bwd = tf.transpose(x_bwd,perm=[1,0,2])
         #this is bt
-        rev_lstm_output = self.rnn_bwd_layer(rev_targets_and_input, initial_state=[hidden_states,cell_states]) 
+        bwd_lstm_output = self.rnn_bwd_layer(x_bwd, initial_state=[hidden_states,cell_states]) 
+        bwd_lstm_output = tf.transpose(bwd_lstm_output,perm=[1,0,2])
+
+        bwd_decoder_output = self.decoder_bwd_layer(bwd_lstm_output)
+        # z_post_params = tf.clip_by_value(z_post_params, -8., 8.)
+        bwd_mu, bwd_logvar = tf.split(bwd_decoder_output, 2, axis=-1)
+
+        assert bwd_mu.shape == y_bwd.shape
+        assert bwd_logvar.shape == y_bwd.shape
+        bwd_states_nll = -log_prob_gaussian(y_bwd, bwd_mu, bwd_logvar)
+
+        bwd_final_output = self.final_bwd_layer(bwd_lstm_output)
+        bwd_lstm_output = tf.reverse_sequence(bwd_lstm_output, seq_lengths, seq_axis=0, batch_axis=1)
+        bwd_final_output = tf.reverse_sequence(bwd_final_output, seq_lengths, seq_axis=0, batch_axis=1)
         
+        return bwd_lstm_output, bwd_final_output, bwd_states_nll
 
-        rev_lstm_output = tf.transpose(rev_lstm_output,perm=[1,0,2])
-        rev_final_output = self.final_bwd_layer(rev_lstm_output[:-1])
+    def call(self,x_fwd, x_bwd, y, x_mask, hidden, cell, fwd_dec=False, return_stats=False):
+        nsteps, nbatch = x_fwd.shape[0], x_fwd.shape[1]
+        bwd_lstm_output, bwd_final_output, bwd_states_nll = self.bwd_pass(x_bwd, x_fwd, hidden, cell)
 
-        rev_lstm_output = tf.reverse_sequence(rev_lstm_output, seq_lengths, seq_axis=0, batch_axis=1)
-        rev_final_output = tf.reverse_sequence(rev_final_output, seq_lengths, seq_axis=0, batch_axis=1)
-        return rev_lstm_output, rev_final_output
-
-    def call(self,inputs, targets, hidden, cell, return_stats=False):
-        bwd_lstm_output, bwd_final_output = self.inference_model(inputs, targets, hidden, cell)
         fwd_final_output, fwd_lstm_output, klds, aux_nll, zs, log_pz, log_qz = self.generative_model(inputs, targets, hidden, cell, bwd_lstm_output)
         
         kld = tf.reduce_sum(klds, 0)
@@ -328,13 +359,12 @@ def unit_test_model():
                      mlp_dim=10, out_dim=x.shape[2]*2, nlayers=1,
                      cond_ln=False)
     hidden_state, cell_state = model.init_hidden_state(x.shape[1])
-    fwd_nll, bwd_nll, aux_nll, kld = model(x,y,hidden_state, cell_state)
-    print(fwd_nll, bwd_nll, aux_nll, kld)
+    fwd_nll, bwd_nll, aux_nll, kld = model(x,y,x,x,hidden_state, cell_state)
+    print(fwd_nll.numpy(), bwd_nll.numpy(), aux_nll.numpy(), kld.numpy())
 
 if __name__ == "__main__":
     tf.enable_eager_execution()
     unit_test_model()
-
 
 
 
