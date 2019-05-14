@@ -354,9 +354,8 @@ class ZForcing(tf.keras.Model):
     def call(self,x_fwd, x_bwd, y, x_mask, hidden_state, cell_state, fwd_dec=False, return_stats=False):
         # x_bwd means x input for bwd pass, its x fwd shofted by 1
         nsteps, nbatch = x_fwd.shape[0], x_fwd.shape[1]
-        bwd_lstm_output, bwd_final_output, bwd_nll = self.bwd_pass(x_bwd, x_fwd, hidden_state, cell_state)
+        bwd_lstm_output, bwd_final_output, bwd_states_nll = self.bwd_pass(x_bwd, x_fwd, hidden_state, cell_state)
         actions = tf.concat((tf.expand_dims(tf.zeros(y.shape[1:], dtype=tf.float32),axis=0),y[:-1]),axis=0)
-        pdb.set_trace()
         fwd_final_output, fwd_lstm_states, klds, aux_nll, zs, log_pz, log_qz, dec_out = self.fwd_pass(x_fwd, hidden_state, cell_state, actions=actions, bwd_states=bwd_lstm_output)
         kld = tf.reduce_sum(klds, 0) #term 4 in eq 7
         log_pz = tf.reduce_sum(log_pz, 0)
@@ -379,9 +378,9 @@ class ZForcing(tf.keras.Model):
         fwd_states = (hidden_state, cell_state)
 
         if return_stats:        
-            return fwd_nll, bwd_nll, aux_nll, kld, log_pz, log_qz, aux_fwd_l2, fwd_states
+            return fwd_nll, bwd_nll, aux_nll, kld, log_pz, log_qz,bwd_states_nll, aux_fwd_l2, fwd_states
         
-        return tf.reduce_mean(fwd_nll), tf.reduce_mean(bwd_nll), tf.reduce_mean(aux_nll), tf.reduce_mean(kld), aux_fwd_l2, fwd_states
+        return tf.reduce_mean(fwd_nll), tf.reduce_mean(bwd_nll), tf.reduce_mean(aux_nll), tf.reduce_mean(kld), bwd_states_nll, aux_fwd_l2, fwd_states
 
 #######################################
 ###### UNIT TEST PORTION ##############
@@ -402,7 +401,7 @@ def unit_test_model():
                      mlp_dim=10, out_dim=x.shape[2]*2, nlayers=1,
                      cond_ln=False)
     hidden_state, cell_state = model.init_hidden_state(x.shape[1])
-    fwd_nll, bwd_nll, aux_nll, kld, aux_fwd_l2, (hidden_state, cell_state) = model(x,y,x,x,hidden_state, cell_state)
+    fwd_nll, bwd_nll, aux_nll, kld, bwd_states_nll, aux_fwd_l2, (hidden_state, cell_state) = model(x,y,x,x,hidden_state, cell_state)
     print(fwd_nll.numpy(), bwd_nll.numpy(), aux_nll.numpy(), kld.numpy())
 
 

@@ -10,6 +10,8 @@ import random
 from zforce_model import ZForcing
 import time
 
+def prepare_data():
+    
 def arg_parser():
     # Parse arguments given by user
     parser = argparse.ArgumentParser()
@@ -24,18 +26,27 @@ def arg_parser():
     # parser.add_argument("--nlayers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--total-epochs", type=int, default=10)
-    parser.add_argument("--rnn_dim", type=int, default=2048)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--batch-size", type=int, default=5)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--rnn_dim", type=int, default=512)
     parser.add_argument("--z_dim", type=int, default=256)
-    parser.add_argument("--emb_dim", type=int, default=1024)
-    parser.add_argument("--mlp_dim", type=int, default=1024)
+    parser.add_argument("--emb_dim", type=int, default=512)
+    parser.add_argument("--mlp_dim", type=int, default=256)
     parser.add_argument("--bwd", type=float, default=0)
-    parser.add_argument("--aux_sta", type=float, default=0.0)
+    parser.add_argument("--aux_start", type=float, default=0.0)
     parser.add_argument("--aux_end", type=float, default=0.0)
     parser.add_argument("--cond_ln", action='store_true')
     parser.add_argument("--z_force", action='store_true')
-    # parser.add_argument("--device", default="gpu:0")
+    parser.add_argument('--bwd-weight', type=float, default=0.,
+                        help='weight for bwd teacher forcing loss')
+    parser.add_argument('--bwd-l2-weight', type=float, default=1e-3,
+                        help='weight for bwd l2 decoding loss')
+    parser.add_argument('--l2-weight', type=float, default=1.,
+                        help='weight for fwd l2 decoding loss')
+    parser.add_argument('--fwd-ll-weight', type=float, default=1.,
+                        help='weight for fwd likelihood loss')
+    parser.add_argument('--kld-weight-start', type=float, default=0.,
+                        help='start weight for kl divergence between prior and posterior z loss')
     args = parser.parse_args()
     return args
 
@@ -59,8 +70,9 @@ def train():
     hidden_state, cell_state = model.init_hidden_state(batch_size)
     optimizer = tf.train.AdamOptimizer(args.learning_rate)
 
-    kld_step = 0.00005
-    aux_step = abs(args.aux_end - args.aux_sta) / (2 * num_train_batches)  # Annealing over two epochs.
+    kld_step = 1e-6
+    aux_step = 1e-6
+    # aux_step = abs(args.aux_end - args.aux_sta) / (2 * num_train_batches)  # Annealing over two epochs.
     print("aux_step: {}".format(aux_step))
     kld_weight = args.kla_sta
     aux_weight = args.aux_sta
@@ -75,13 +87,21 @@ def train():
         # for x,y in train_data:
         step+=1
         with tf.GradientTape() as tape:
-            fwd_nll, bwd_nll, aux_nll, kld = model(x, y, hidden_state, cell_state)
+            fwd_nll, bwd_nll, aux_nll, kld, bwd_l2_loss, awx_fwd_l2, lstm_states = model(x, y, hidden_state, cell_state)
+            
             bwd_nll = (aux_weight > 0.) * (bwd * bwd_nll)
             aux_nll = aux_weight * aux_nll
-            all_loss = fwd_nll + bwd_nll + aux_nll + kld_weight * kld
+            fwd_nll = args.fwd_ll_weight * fwd_nll #args
+            kld = kld_weight * kld
+            bwd_l2_loss = args.bwd_l2_weight * bwd_l2_loss #args
+
+            all_loss = fwd_nll + bwd_nll + aux_nll + kld + 1. * aux_fwd_l2 +  bwd_l2_loss
+            fwd_loss = (fwd_nll + aux_nll + kld) + aux_fwd_l2
+            bwd_loss = bwd_nll + bwd_l2_loss
             # anneal kld cost
             kld_weight += kld_step
             kld_weight = min(kld_weight, 1.)
+            aux_loss = bwd_l2_loss
             # anneal auxiliary cost
             if args.aux_sta <= args.aux_end:
                 aux_weight += aux_step
@@ -96,7 +116,8 @@ def train():
                 print("NaN", end="\r")  # Useful to see if training is stuck.
                 continue        
 
-        grads = tape.gradient(all_loss, model.trainable_variables)
+        # for now do all loss, the paper does separate for fwd and bwd
+        grads = tape.gradient(all_loss, model.trainable_variables) 
         # grads_clipped, _ = tf.clip_by_global_norm(grads, clip_norm=100)
         optimizer.apply_gradients(
             zip(grads, model.trainable_variables),
