@@ -66,6 +66,7 @@ class ZForcing(tf.keras.Model):
         self.dropout = dropout
         self.out_type = out_type
         self.mlp_dim = mlp_dim
+        self.action_emb_dim = emb_dim/2
         self.cond_ln = cond_ln
         self.z_force = z_force
         self.use_l2 = use_l2
@@ -80,6 +81,13 @@ class ZForcing(tf.keras.Model):
         self.embedding_layer = tf.keras.models.Sequential([
             tf.keras.layers.Dense(units=emb_dim, input_dim=inp_dim), 
             tf.keras.layers.Dropout(rate=dropout)
+        ])
+
+        self.action_embedding_layer = tf.keras.models.Sequential([
+            tf.keras.layers.Dense(units=int(self.action_emb_dim), input_dim=3),
+            LReLU(), 
+            tf.keras.layers.Dense(units=int(self.action_emb_dim)/2, input_dim=int(self.action_emb_dim)),
+            # tf.keras.layers.Dropout(rate=dropout)
         ])
 
         # LSTM LAYERS
@@ -120,9 +128,9 @@ class ZForcing(tf.keras.Model):
             tf.keras.layers.Dense(units=out_dim)
         ])
         self.decoder_fwd_layer = tf.keras.models.Sequential([
-            tf.keras.layers.Dense(units=mlp_dim, input_dim=rnn_dim), 
+            tf.keras.layers.Dense(units=mlp_dim), 
             LReLU(), 
-            tf.keras.layers.Dense(units=out_dim)
+            tf.keras.layers.Dense(units=inp_dim)
         ])
 
         # FINAL LAYERS - gives next state
@@ -165,24 +173,26 @@ class ZForcing(tf.keras.Model):
         cell_state = tf.tile(self.initial_cell_state[None, ...], [batch_size, 1])
         return hidden_state, cell_state
 
-    def generative_model(self, inputs, targets, hidden_states, cell_states, bwd_lstm_output=None, z_step=None):
+    def fwd_pass(self, x_fwd, hidden_states, cell_states, actions=None, eval_=False, bwd_states=None, z_step=None):
         # pdb.set_trace()
-        num_steps = inputs.shape[0]         
-        inputs = self.embedding_layer(inputs)
-        klds, zs, log_pz, log_qz, aux_cs = [], [], [], [], []
+        num_steps = x_fwd.shape[0]
+        x_fwd_reshape = tf.reshape(x_fwd, [-1, x_fwd.shape[2]])        
+        x_emb = self.embedding_layer(x_fwd_reshape)
+        x_fwd = tf.reshape(x_emb, [*x_fwd.shape[:2], self.emb_dim])
 
-        rnn_states = [(hidden_states, cell_states)]
-        eps = tf.random.normal([num_steps, inputs.shape[1], self.z_dim], dtype=self.trainable_variables[0].dtype)
-        big = tf.zeros(inputs.shape[1], dtype=self.trainable_variables[0].dtype) + 0.5
-        big = tfp.distributions.Bernoulli(big).sample()
-        big = tf.expand_dims(big, 1)
+        klds, zs, log_pz, log_qz, aux_cs, decoder_outputs = [], [], [], [], [], []
+        lstm_states = [(hidden_states, cell_states)]
+        eps = tf.random.normal([num_steps, x_fwd.shape[1], self.z_dim], dtype=self.trainable_variables[0].dtype)
+        # big = tf.zeros(inputs.shape[1], dtype=self.trainable_variables[0].dtype) + 0.5
+        # big = tfp.distributions.Bernoulli(big).sample()
+        # big = tf.expand_dims(big, 1)
         assert (z_step is None) or (nsteps == 1)
 
         for step in range(num_steps):
             print("step ",step)
-            hidden_step, cell_step = rnn_states[step] #check if same for every step
+            hidden_step, cell_step = lstm_states[step] #check if same for every step
             # print("hidden ",hidden_step)
-            input_step = inputs[step]
+            x_step = x_fwd[step]
             r_step = eps[step]
 
             # prior func of hidden state
@@ -191,8 +201,9 @@ class ZForcing(tf.keras.Model):
             z_pri_mu, z_pri_logvar = tf.split(z_pri_params, 2, axis=1)
 
             # incorp posterior
-            if bwd_lstm_output is not None:
-                b_step = bwd_lstm_output[step]
+            if bwd_states is not None:
+                b_step = bwd_states[step]
+                b_step = tf.stop_gradient(b_step)
                 z_post_params = self.latent_post_layer(tf.concat((hidden_step, b_step), axis=1))
                 z_post_params = tf.clip_by_value(z_post_params, -8., 8.)
                 z_post_mu, z_post_logvar = tf.split(z_post_params, 2, axis=1)                
@@ -204,17 +215,19 @@ class ZForcing(tf.keras.Model):
 
                 # use only latent variables
                 if self.z_force:
-                    hidden_step = hidden_step * 0.
+                    hidden_step_ = hidden_step * 0.
+                else:
+                    hidden_step_ = hidden_step
 
                 # looks like aux loss, reconstruct bwd step pred using h and z
                 # apparently z force is always set to 0, so it uses on h as the paper says. 
                 ##### check again
-                aux_params = self.aux_reconstruction_layer(tf.concat((hidden_step, z_step), axis=1))
+                aux_params = self.aux_reconstruction_layer(tf.concat((hidden_step_, z_step), axis=1))
                 aux_params = tf.clip_by_value(aux_params, -8., 8.)
                 aux_mu, aux_logvar = tf.split(aux_params, 2, axis=1)
 
                 # disconnect gradient here,paper talks about this
-                b_step_ = tf.stop_gradient(b_step)
+                b_step_ = b_step
 
                 # l2 loss or log prob
                 if self.use_l2:
@@ -232,6 +245,9 @@ class ZForcing(tf.keras.Model):
                 z_post_mu, z_post_logvar = z_pri_mu, z_pri_logvar
                 kld = aux_step
             
+            action_step = self.action_embedding_layer(actions[step])
+            action_step = tf.cast(action_step, tf.float32)
+            input_step = tf.concat((action_step, z_step), axis=1)
             z_gen_step = self.generation_layer(z_step)
             
             # the generation part with LSTM
@@ -244,11 +260,12 @@ class ZForcing(tf.keras.Model):
             #                                 gain_hh=gain_hh, bias_hh=bias_hh) #1lstmcell
 
             # else:
-            rnn_fwd_output, rnn_states_new = self.rnn_fwd_layer(tf.concat((z_gen_step, input_step), 1),
+            fwd_lstm_output, (hidden_states_new, cell_states_new) = self.rnn_fwd_layer(tf.concat((z_gen_step, x_step), 1),
                                         (hidden_step, cell_step)) #1lstmcell
 
-
-            rnn_states.append(rnn_states_new)
+            fwd_decoder_output = self.decoder_fwd_layer(tf.concat((hidden_states_new, input_step), 1))
+            decoder_outputs.append(fwd_decoder_output)
+            lstm_states.append((hidden_states_new, cell_states_new))
             klds.append(kld)
             zs.append(z_step)
             aux_cs.append(aux_step)
@@ -264,16 +281,15 @@ class ZForcing(tf.keras.Model):
         log_pz = tf.stack(log_pz, 0)
         log_qz = tf.stack(log_qz, 0)
         zs = tf.stack(zs, 0)
-
+        decoder_outputs = tf.stack(decoder_outputs, 0)
         # get only hidden states for all steps
         #first one is initialized, so all 0
-        fwd_outputs = [s[0] for s in rnn_states[1:]]
+        fwd_outputs = [s[0] for s in lstm_states[1:]]
         fwd_outputs = tf.stack(fwd_outputs, 0)
-        
         
         fwd_final_outputs = self.final_fwd_layer(fwd_outputs) #final network to predict next states
         
-        return fwd_final_outputs, rnn_states[1:], klds, aux_cs, zs, log_pz, log_qz            
+        return fwd_final_outputs, lstm_states[1:], klds, aux_cs, zs, log_pz, log_qz, decoder_outputs            
 
 
     # backward pass
@@ -304,6 +320,7 @@ class ZForcing(tf.keras.Model):
 
         assert bwd_mu.shape == y_bwd.shape
         assert bwd_logvar.shape == y_bwd.shape
+        
         bwd_states_nll = -log_prob_gaussian(y_bwd, bwd_mu, bwd_logvar)
 
         bwd_final_output = self.final_bwd_layer(bwd_lstm_output)
@@ -312,33 +329,59 @@ class ZForcing(tf.keras.Model):
         
         return bwd_lstm_output, bwd_final_output, bwd_states_nll
 
-    def call(self,x_fwd, x_bwd, y, x_mask, hidden, cell, fwd_dec=False, return_stats=False):
-        nsteps, nbatch = x_fwd.shape[0], x_fwd.shape[1]
-        bwd_lstm_output, bwd_final_output, bwd_states_nll = self.bwd_pass(x_bwd, x_fwd, hidden, cell)
+    def infer(self, x, hidden):
+        '''Infer latent variables for a given batch of sentences ``x''.
+        '''
+        x_ = x[:-1]
+        y_ = x[1:]
+        bwd_states, bwd_outputs, dec_bwd_outputs, _ = self.bwd_pass(x_, y_, hidden)
+        fwd_outputs, fwd_states, klds, aux_nll, zs, log_pz, log_qz, dec_outs = self.fwd_pass(
+                x_, hidden, bwd_states=bwd_states)
+        return zs
 
-        fwd_final_output, fwd_lstm_output, klds, aux_nll, zs, log_pz, log_qz = self.generative_model(inputs, targets, hidden, cell, bwd_lstm_output)
-        
-        kld = tf.reduce_sum(klds, 0)
+    def generate_onestep(self, x_fwd, hidden_state, cell_state, return_decode=False, action=None):
+        pdb.set_trace()
+        nsteps, nbatch = x_fwd.shape[0], x_fwd.shape[1]
+        fwd_final_output, fwd_lstm_states, klds, aux_nll, zs, log_pz, log_qz, dec_outs = self.fwd_pass(
+            x_fwd, hidden_state, cell_state, actions=action, bwd_states=None, eval_=True)
+        out_mu, out_logvar = torch.split(fwd_final_output, 2, -1) 
+        fwd_lstm_states = (tf.expand_dims(fwd_lstm_states[0][0],0), tf.expand_dims(fwd_lstm_states[0][1],0))
+        if return_decode:
+            return (out_mu, out_logvar, fwd_lstm_states, dec_outs)
+        else:
+            return (out_mu, out_logvar, fwd_lstm_states)
+
+    def call(self,x_fwd, x_bwd, y, x_mask, hidden_state, cell_state, fwd_dec=False, return_stats=False):
+        # x_bwd means x input for bwd pass, its x fwd shofted by 1
+        nsteps, nbatch = x_fwd.shape[0], x_fwd.shape[1]
+        bwd_lstm_output, bwd_final_output, bwd_nll = self.bwd_pass(x_bwd, x_fwd, hidden_state, cell_state)
+        actions = tf.concat((tf.expand_dims(tf.zeros(y.shape[1:], dtype=tf.float32),axis=0),y[:-1]),axis=0)
+        pdb.set_trace()
+        fwd_final_output, fwd_lstm_states, klds, aux_nll, zs, log_pz, log_qz, dec_out = self.fwd_pass(x_fwd, hidden_state, cell_state, actions=actions, bwd_states=bwd_lstm_output)
+        kld = tf.reduce_sum(klds, 0) #term 4 in eq 7
         log_pz = tf.reduce_sum(log_pz, 0)
         log_qz = tf.reduce_sum(log_qz, 0)
-        aux_nll = tf.reduce_sum(aux_nll, 0)
+        aux_nll = tf.reduce_sum(aux_nll, 0) #term 3 in eq 7
+        aux_fwd_l2 = tf.losses.mean_squared_error(dec_out, x_bwd)
 
         if self.out_type == 'gaussian':
-            out_mu, out_logvar = tf.split(fwd_final_output, 2, -1)
-            
+            out_mu, out_logvar = tf.split(fwd_final_output, 2, -1)            
             # for forward, true is y
-            fwd_nll = -log_prob_gaussian(targets, out_mu, out_logvar)
+            fwd_nll = -log_prob_gaussian(y, out_mu, out_logvar)
             fwd_nll = tf.reduce_sum(fwd_nll,0)
-
             # for bwd, true is x
             out_mu, out_logvar = tf.split(bwd_final_output, 2, -1)
-            bwd_nll = -log_prob_gaussian(inputs, out_mu, out_logvar)
+            bwd_nll = -log_prob_gaussian(y, out_mu, out_logvar)
             bwd_nll = tf.reduce_sum(bwd_nll,0)
         
+        hidden_state = fwd_lstm_states[-1][0]
+        cell_state =  fwd_lstm_states[-1][1]
+        fwd_states = (hidden_state, cell_state)
+
         if return_stats:        
-            return fwd_nll, bwd_nll, aux_nll, kld, log_pz, log_qz
+            return fwd_nll, bwd_nll, aux_nll, kld, log_pz, log_qz, aux_fwd_l2, fwd_states
         
-        return tf.reduce_mean(fwd_nll), tf.reduce_mean(bwd_nll), tf.reduce_mean(aux_nll), tf.reduce_mean(kld)
+        return tf.reduce_mean(fwd_nll), tf.reduce_mean(bwd_nll), tf.reduce_mean(aux_nll), tf.reduce_mean(kld), aux_fwd_l2, fwd_states
 
 #######################################
 ###### UNIT TEST PORTION ##############
@@ -359,8 +402,9 @@ def unit_test_model():
                      mlp_dim=10, out_dim=x.shape[2]*2, nlayers=1,
                      cond_ln=False)
     hidden_state, cell_state = model.init_hidden_state(x.shape[1])
-    fwd_nll, bwd_nll, aux_nll, kld = model(x,y,x,x,hidden_state, cell_state)
+    fwd_nll, bwd_nll, aux_nll, kld, aux_fwd_l2, (hidden_state, cell_state) = model(x,y,x,x,hidden_state, cell_state)
     print(fwd_nll.numpy(), bwd_nll.numpy(), aux_nll.numpy(), kld.numpy())
+
 
 if __name__ == "__main__":
     tf.enable_eager_execution()
